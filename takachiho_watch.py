@@ -26,81 +26,158 @@ STATE_FILE = Path(__file__).with_name("takachiho_state.json")
 # ページ内のカレンダー表を読む。構造が想定と違えば error を返す（黙って失敗しない）
 JS_EXTRACT = r"""
 () => {
-  const rows = [...document.querySelectorAll('tr')];
+  const R = e => e.getBoundingClientRect();
   const dateRe = /(\d{1,2})\/(\d{1,2})/;
-  const timeRe = /^\d{1,2}:\d{2}$/;
-  let header = null, headerIdx = -1;
-  for (let i = 0; i < rows.length; i++) {
-    const cells = [...rows[i].children];
-    const hits = cells.filter(c => dateRe.test(c.innerText || '')).length;
-    if (hits >= 7) { header = cells; headerIdx = i; break; }
-  }
-  if (!header) return {error: '日付ヘッダ行が見つかりません', rowCount: rows.length};
-  const dates = [];
-  header.forEach(c => {
-    const m = (c.innerText || '').match(dateRe);
-    if (m) dates.push(m[1].padStart(2, '0') + '/' + m[2].padStart(2, '0'));
-  });
-  const out = [], rowInfo = [];
-  let labeled = 0, skipped = 0;
-  for (let i = headerIdx + 1; i < rows.length; i++) {
-    const cells = [...rows[i].children];
-    const li = cells.findIndex(c => timeRe.test((c.innerText || '').trim()));
-    if (rowInfo.length < 4) rowInfo.push(cells.length + ':' + (cells[0] ? (cells[0].innerText || '').trim().slice(0, 8) : ''));
-    if (li < 0) continue;
-    labeled++;
-    const day = cells.slice(li + 1);
-    if (day.length !== dates.length) { skipped++; continue; }
-    const t = (cells[li].innerText || '').trim().padStart(5, '0');
-    day.forEach((c, j) => {
-      out.push({
-        date: dates[j], time: t,
-        text: (c.innerText || '').replace(/\s+/g, ''),
-        hasLink: !!c.querySelector('a,button,input'),
-        alt: [...c.querySelectorAll('img')].map(x => x.alt || '').join('')
+  // --- 日付ヘッダ行（日付を7つ以上含む行）。列のx範囲を取る
+  let cols = [];
+  for (const tr of document.querySelectorAll('tr')) {
+    const cs = [...tr.children].filter(c => dateRe.test(c.innerText || '') && R(c).width > 0);
+    if (cs.length >= 7) {
+      cols = cs.map(c => {
+        const m = c.innerText.match(dateRe), r = R(c);
+        return {date: m[1].padStart(2, '0') + '/' + m[2].padStart(2, '0'), x0: r.left, x1: r.right};
       });
-    });
+      break;
+    }
   }
-  return {slots: out, dates: dates, headerLen: header.length, rowCount: rows.length,
-          labeled: labeled, skipped: skipped, rowInfo: rowInfo};
+  if (!cols.length) return {error: '日付ヘッダ行が見つかりません'};
+  // --- 時刻ラベル（葉要素で "H:MM" だけの要素）。行の上端yを使う
+  const labels = [];
+  for (const e of document.querySelectorAll('*')) {
+    if (e.children.length) continue;
+    const t = (e.textContent || '').trim();
+    if (!/^\d{1,2}:\d{2}$/.test(t)) continue;
+    const row = e.closest('tr') || e;
+    const r = R(row);
+    if (r.height <= 0) continue;
+    const [h, m] = t.split(':').map(Number);
+    labels.push({t: h * 60 + m, y: r.top, h: r.height});
+  }
+  labels.sort((p, q) => p.y - q.y);
+  const uniq = labels.filter((l, i) => i === 0 || Math.abs(l.y - labels[i - 1].y) > 2);
+  if (uniq.length < 2) return {error: '時刻ラベルが見つかりません', cols: cols.map(c => c.date)};
+  const first = uniq[0], last = uniq[uniq.length - 1];
+  const slope = (last.t - first.t) / (last.y - first.y);   // 分/ピクセル
+  const minAt = y => first.t + (y - first.y) * slope;
+  const fmt = m => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+  const colOf = x => cols.find(c => x >= c.x0 && x <= c.x1);
+  // --- イベント要素（FullCalendarのルート要素）
+  const roots = [...document.querySelectorAll('.fc-event,.fc-bg-event,.fc-bgevent,.fc-time-grid-event,.fc-timegrid-event')]
+    .filter(e => R(e).width > 0 && R(e).height > 0);
+  const out = [], seen = new Set();
+  const gridTop = first.y - 2, gridBot = last.y + last.h;
+  const add = (e, how, center) => {
+    const r = R(e), y = center ? (r.top + r.bottom) / 2 : r.top;
+    if (y < gridTop || y > gridBot) return;                 // 表の外(凡例など)は無視
+    const col = colOf((r.left + r.right) / 2);
+    if (!col) return;
+    const mins = Math.floor((minAt(y) + (center ? 0 : 2)) / 30) * 30;
+    const key = col.date + '_' + mins;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({date: col.date, time: fmt(mins), text: (e.innerText || e.textContent || '').replace(/\s+/g, ''),
+              hasLink: e.tagName === 'A' || !!e.querySelector('a,button,input'),
+              alt: [...e.querySelectorAll('img')].map(x => x.alt || '').join(''),
+              cls: (e.className || '').toString().slice(0, 40), how: how});
+  };
+  roots.forEach(e => add(e, 'root', false));
+  // --- 予備: 記号だけの葉要素（クラスが想定外でも拾う）
+  for (const e of document.querySelectorAll('*')) {
+    if (e.children.length) continue;
+    const t = (e.textContent || '').trim();
+    if (/^[×✕✖○◯◎△▲]$/.test(t) && R(e).width > 0) add(e, 'symbol', true);
+  }
+  // --- 予備: 「残1艇」のような表示（クラス名が不明でも拾う。最も内側の要素のみ）
+  const zanRe = /残\d+艇?/;
+  for (const e of document.querySelectorAll('*')) {
+    const t = (e.innerText || '').replace(/\s+/g, '');
+    if (!zanRe.test(t) || t.length > 12 || R(e).width <= 0) continue;
+    if ([...e.children].some(c => zanRe.test((c.innerText || '').replace(/\s+/g, '')))) continue;
+    add(e, 'zan', true);
+  }
+  return {slots: out, cols: cols.map(c => c.date), labelCount: uniq.length,
+          firstLabel: fmt(first.t), lastLabel: fmt(last.t), rootCount: roots.length};
 }
 """
 
 
 def classify(cell):
-    """'full' | 'notopen' | 'avail' | 'unknown'"""
+    """'full' | 'notopen' | 'avail' | 'unknown'（空きは確実な記号のみ。誤通知を避ける）"""
     s = cell["text"] + cell["alt"]
-    if "×" in s or "✕" in s or "満" in s:
+    if any(k in s for k in "×✕✖満締休終"):
         return "full"
     if "砂時計" in s or "⌛" in s or "⏳" in s:
         return "notopen"
-    if s or cell["hasLink"]:
+    if any(k in s for k in "○◯◎△残空") or (cell["hasLink"] and s):
         return "avail"
     return "unknown"
 
 
 DEBUG = {}
+NET = []
+
+
+HEADER_JS = r"""
+() => {
+  for (const tr of document.querySelectorAll('tr')) {
+    const ds = [...tr.children].map(c => (c.innerText || '').match(/(\d{1,2})\/(\d{1,2})/))
+      .filter(Boolean).map(m => m[1].padStart(2, '0') + '/' + m[2].padStart(2, '0'));
+    if (ds.length >= 7) return ds;
+  }
+  return [];
+}
+"""
+
+ANCHOR_JS = r"""
+() => {
+  const re = /\d{4}\/\d{2}\/\d{2}\D{1,3}\d{4}\/\d{2}\/\d{2}/;
+  let best = null, bl = 1e9;
+  for (const e of document.querySelectorAll('select,div,span,a,button,label,p')) {
+    const t = (e.textContent || '');
+    if (!re.test(t) || e.getBoundingClientRect().width <= 0) continue;
+    if (t.length < bl) { best = e; bl = t.length; }
+  }
+  if (!best) return null;
+  best.scrollIntoView({block: 'center'});
+  const r = best.getBoundingClientRect();
+  return {x: r.right, y: r.top + r.height / 2, h: r.height, tag: best.tagName};
+}
+"""
+
+
+def week_dates(page):
+    try:
+        return page.evaluate(HEADER_JS)
+    except Exception:
+        return []
 
 
 def pick_week(page, target):
-    """週表示にして、target日を含む週を選ぶ"""
+    """週表示にして、target日を含む週へ移動する"""
+    key = target.strftime("%m/%d")
     try:
         page.get_by_text("週", exact=True).first.click(timeout=5000)
         DEBUG["week_click"] = "ok"
     except Exception as e:
         DEBUG["week_click"] = "失敗: " + str(e)[:60]
     page.wait_for_timeout(2500)
-    sel = page.locator("select").filter(has_text=re.compile(r"\d{4}/\d{2}/\d{2}〜"))
-    DEBUG["week_select_count"] = sel.count()
-    if sel.count() == 0:
+    DEBUG["dates_before"] = week_dates(page)[:1] + week_dates(page)[-1:]
+    try:  # 動作確認用: 移動前の週で「full以外」に判定された枠（今見えている空きが拾えているか）
+        r0 = page.evaluate(JS_EXTRACT)
+        DEBUG["initial_week_nonfull"] = ["%s %s %s %s" % (c["date"], c["time"], c["text"][:6], classify(c))
+                                         for c in r0.get("slots", []) if classify(c) != "full"][:8]
+    except Exception as e:
+        DEBUG["initial_week_nonfull"] = "err " + str(e)[:40]
+    if key in week_dates(page):
         return
-    for opt in sel.first.locator("option").all():
-        label = opt.inner_text().strip()
-        m = re.findall(r"(\d{4})/(\d{2})/(\d{2})", label)
-        if len(m) == 2:
-            a = dt.date(*map(int, m[0]))
-            b = dt.date(*map(int, m[1]))
-            if a <= target <= b:
+    # 1) 週のプルダウン（〜は全角/半角の違いがあるので全て許容）
+    sel = page.locator("select").filter(has_text=re.compile(r"\d{4}/\d{2}/\d{2}"))
+    DEBUG["week_select_count"] = sel.count()
+    if sel.count():
+        for opt in sel.first.locator("option").all():
+            label = opt.inner_text().strip()
+            m = re.findall(r"(\d{4})/(\d{2})/(\d{2})", label)
+            if len(m) == 2 and dt.date(*map(int, m[0])) <= target <= dt.date(*map(int, m[1])):
                 sel.first.select_option(label=label)
                 DEBUG["week_selected"] = label
                 try:
@@ -108,16 +185,49 @@ def pick_week(page, target):
                 except Exception:
                     pass
                 page.wait_for_timeout(2500)
-                return
+                if key in week_dates(page):
+                    return
+                break
+    # 2) 次週の矢印（週表示の右側の「▶」）を座標でクリックして移動（最大4回）
+    for i in range(4):
+        pos = page.evaluate(ANCHOR_JS)
+        DEBUG["anchor_%d" % i] = pos
+        if not pos:
+            break
+        before = week_dates(page)[:1]
+        for dx in (22, 38, 12):
+            page.mouse.click(pos["x"] + dx, pos["y"])
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2500)
+            if week_dates(page)[:1] != before:
+                DEBUG["arrow_dx"] = dx
+                break
+        if key in week_dates(page):
+            return
 
 
 def fetch_slots(pw, target, dump=False):
     browser = pw.chromium.launch(headless=True)
     try:
-        page = browser.new_page(viewport={"width": 480, "height": 900})
+        page = browser.new_page(viewport={"width": 1100, "height": 900})
+        NET.clear()
+
+        def on_resp(r):
+            try:
+                ct = r.headers.get("content-type", "")
+                if "json" in ct or "javascript" in ct:
+                    NET.append((r.url[-90:], r.status, r.text()[:220].replace("\n", " ")))
+            except Exception:
+                pass
+        page.on("response", on_resp)
         page.goto(URL, wait_until="networkidle", timeout=60000)
         pick_week(page, target)
         res = page.evaluate(JS_EXTRACT)
+        if "error" not in res and target.strftime("%m/%d") not in res["cols"]:
+            res = {"error": "対象日を含む週に移動できませんでした", "cols": res["cols"]}
         if dump:
             Path("takachiho_page.html").write_text(page.content(), encoding="utf-8")
         return res
@@ -175,14 +285,15 @@ def main():
                 print("=== 診断", t, "===")
                 print("DEBUG:", DEBUG)
                 print({k: v for k, v in res.items() if k != "slots"})
+                for u, st, body in NET[:4]:
+                    print("NET:", st, u, body)
                 if "error" in res:
                     continue
-                n = 0
-                for c in res["slots"]:
-                    if c["date"] == t.strftime("%m/%d"):
-                        n += 1
-                        print(c["date"], c["time"], repr(c["text"]), classify(c))
-                print("該当日の枠数:", n)
+                key = t.strftime("%m/%d")
+                rows = [c for c in res["slots"] if c["date"] == key]
+                print("該当日の枠数:", len(rows))
+                for c in sorted(rows, key=lambda c: c["time"])[:14]:
+                    print(c["date"], c["time"], repr(c["text"]), classify(c), c["cls"], c["how"])
             return
 
         if args.heartbeat_hours and not args.once:
@@ -205,7 +316,7 @@ def main():
                         k = f'{t}_{c["time"]}'
                         now_avail = classify(c) == "avail"
                         if now_avail and not state.get(k):
-                            found.append(f'{t.strftime("%m/%d")} {c["time"]}')
+                            found.append(f'{t.strftime("%m/%d")} {c["time"]} {c["text"][:8]}')
                         state[k] = now_avail
                 STATE_FILE.write_text(json.dumps(state))
                 fails = 0
