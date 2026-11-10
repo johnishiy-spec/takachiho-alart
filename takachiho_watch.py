@@ -64,21 +64,49 @@ JS_EXTRACT = r"""
   // --- イベント要素（FullCalendarのルート要素）
   const roots = [...document.querySelectorAll('.fc-event,.fc-bg-event,.fc-bgevent,.fc-time-grid-event,.fc-timegrid-event')]
     .filter(e => R(e).width > 0 && R(e).height > 0);
-  const out = [], seen = new Set();
+  const out = [];
   const gridTop = first.y - 2, gridBot = last.y + last.h;
+  const parseC = c => { const m = (c || '').match(/rgba?\(([^)]+)\)/); if (!m) return null;
+    const p = m[1].split(',').map(parseFloat); return {r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1}; };
+  const colorClass = c => { const q = parseC(c); if (!q || q.a < 0.3) return '';
+    if (Math.abs(q.r - q.g) < 14 && Math.abs(q.g - q.b) < 14 && q.r >= 120 && q.r <= 235) return 'gray';
+    if (q.b - q.r >= 40 && q.b >= 180) return 'blue';
+    return 'other'; };
+  const sig = e => {   // 要素と子孫(最大8個)の背景色の種類・::before/::after の文字
+    const els = [e, ...[...e.querySelectorAll('*')].slice(0, 8)];
+    let col = '', ps = '';
+    for (const x of els) {
+      const cs = getComputedStyle(x);
+      if (!col) col = colorClass(cs.backgroundColor);
+      for (const pe of ['::before', '::after']) {
+        const c = getComputedStyle(x, pe).content;
+        if (c && c !== 'none' && c !== 'normal') ps += c.replace(/["']/g, '');
+      }
+    }
+    return {col, ps};
+  };
+  const slotMap = new Map();
   const add = (e, how, center) => {
     const r = R(e), y = center ? (r.top + r.bottom) / 2 : r.top;
     if (y < gridTop || y > gridBot) return;                 // 表の外(凡例など)は無視
     const col = colOf((r.left + r.right) / 2);
     if (!col) return;
-    const mins = Math.floor((minAt(y) + (center ? 0 : 2)) / 30) * 30;
-    const key = col.date + '_' + mins;
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({date: col.date, time: fmt(mins), text: (e.innerText || e.textContent || '').replace(/\s+/g, ''),
-              hasLink: e.tagName === 'A' || !!e.querySelector('a,button,input'),
-              alt: [...e.querySelectorAll('img')].map(x => x.alt || '').join(''),
-              cls: (e.className || '').toString().slice(0, 40), how: how});
+    const text = (e.innerText || e.textContent || '').replace(/\s+/g, '');
+    let tm = fmt(Math.floor((minAt(y) + (center ? 0 : 2)) / 30) * 30);
+    const m = text.match(/(\d{1,2}):(\d{2})-\d{1,2}:\d{2}/);   // イベント自身の「10:30-11:00」を優先
+    if (m) tm = m[1].padStart(2, '0') + ':' + m[2];
+    const key = col.date + '_' + tm;
+    const sg = sig(e);
+    let o = slotMap.get(key);
+    if (!o) {
+      o = {date: col.date, time: tm, text: '', hasLink: false, alt: '', pseudo: '', col: '', cls: '', how: how};
+      slotMap.set(key, o); out.push(o);
+    }
+    o.text += text; o.pseudo += sg.ps;
+    o.hasLink = o.hasLink || e.tagName === 'A' || !!e.querySelector('a,button,input');
+    o.alt += [...e.querySelectorAll('img')].map(x => x.alt || '').join('');
+    if (sg.col === 'blue' || (sg.col && !o.col)) o.col = o.col === 'blue' ? 'blue' : sg.col;
+    if (!o.cls) o.cls = (e.className || '').toString().slice(0, 30);
   };
   roots.forEach(e => add(e, 'root', false));
   // --- 予備: 記号だけの葉要素（クラスが想定外でも拾う）
@@ -102,14 +130,20 @@ JS_EXTRACT = r"""
 
 
 def classify(cell):
-    """'full' | 'notopen' | 'avail' | 'unknown'（空きは確実な記号のみ。誤通知を避ける）"""
-    s = cell["text"] + cell["alt"]
+    """'full' | 'notopen' | 'avail' | 'unknown'
+    空きは「残」「○」等の文字か、青い背景のときだけ。時刻だけの要素は空きにしない"""
+    s = cell["text"] + cell["alt"] + cell.get("pseudo", "")
     if any(k in s for k in "×✕✖満締休終"):
         return "full"
     if "砂時計" in s or "⌛" in s or "⏳" in s:
         return "notopen"
-    if any(k in s for k in "○◯◎△残空") or (cell["hasLink"] and s):
+    if "残" in s or any(k in s for k in "○◯◎△"):
         return "avail"
+    col = cell.get("col", "")
+    if col == "blue":
+        return "avail"
+    if col == "gray":
+        return "full"
     return "unknown"
 
 
@@ -291,9 +325,15 @@ def main():
                     continue
                 key = t.strftime("%m/%d")
                 rows = [c for c in res["slots"] if c["date"] == key]
-                print("該当日の枠数:", len(rows))
-                for c in sorted(rows, key=lambda c: c["time"])[:14]:
-                    print(c["date"], c["time"], repr(c["text"]), classify(c), c["cls"], c["how"])
+                from collections import Counter
+                print("該当日の枠数:", len(rows), dict(Counter(classify(c) for c in rows)))
+                shown = 0
+                for c in sorted(rows, key=lambda c: c["time"]):
+                    if classify(c) != "full" or shown < 2:
+                        shown += 1
+                        print(c["time"], classify(c), "text=", c["text"][:14], "ps=", c["pseudo"][:4], "bg=", c["col"])
+                        if shown >= 8:
+                            break
             return
 
         if args.heartbeat_hours and not args.once:
