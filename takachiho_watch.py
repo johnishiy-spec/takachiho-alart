@@ -28,34 +28,41 @@ JS_EXTRACT = r"""
 () => {
   const rows = [...document.querySelectorAll('tr')];
   const dateRe = /(\d{1,2})\/(\d{1,2})/;
+  const timeRe = /^\d{1,2}:\d{2}$/;
   let header = null, headerIdx = -1;
   for (let i = 0; i < rows.length; i++) {
     const cells = [...rows[i].children];
     const hits = cells.filter(c => dateRe.test(c.innerText || '')).length;
     if (hits >= 7) { header = cells; headerIdx = i; break; }
   }
-  if (!header) return {error: '日付ヘッダ行が見つかりません'};
-  const dates = header.map(c => {
+  if (!header) return {error: '日付ヘッダ行が見つかりません', rowCount: rows.length};
+  const dates = [];
+  header.forEach(c => {
     const m = (c.innerText || '').match(dateRe);
-    return m ? m[1].padStart(2, '0') + '/' + m[2].padStart(2, '0') : null;
+    if (m) dates.push(m[1].padStart(2, '0') + '/' + m[2].padStart(2, '0'));
   });
-  const out = [];
+  const out = [], rowInfo = [];
+  let labeled = 0, skipped = 0;
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const cells = [...rows[i].children];
-    if (cells.length !== header.length) continue;
-    const t = (cells[0].innerText || '').trim();
-    if (!/^\d{1,2}:\d{2}$/.test(t)) continue;
-    cells.forEach((c, j) => {
-      if (!dates[j]) return;
+    const li = cells.findIndex(c => timeRe.test((c.innerText || '').trim()));
+    if (rowInfo.length < 4) rowInfo.push(cells.length + ':' + (cells[0] ? (cells[0].innerText || '').trim().slice(0, 8) : ''));
+    if (li < 0) continue;
+    labeled++;
+    const day = cells.slice(li + 1);
+    if (day.length !== dates.length) { skipped++; continue; }
+    const t = (cells[li].innerText || '').trim().padStart(5, '0');
+    day.forEach((c, j) => {
       out.push({
-        date: dates[j], time: t.padStart(5, '0'),
+        date: dates[j], time: t,
         text: (c.innerText || '').replace(/\s+/g, ''),
         hasLink: !!c.querySelector('a,button,input'),
         alt: [...c.querySelectorAll('img')].map(x => x.alt || '').join('')
       });
     });
   }
-  return {slots: out};
+  return {slots: out, dates: dates, headerLen: header.length, rowCount: rows.length,
+          labeled: labeled, skipped: skipped, rowInfo: rowInfo};
 }
 """
 
@@ -72,14 +79,19 @@ def classify(cell):
     return "unknown"
 
 
+DEBUG = {}
+
+
 def pick_week(page, target):
     """週表示にして、target日を含む週を選ぶ"""
     try:
         page.get_by_text("週", exact=True).first.click(timeout=5000)
-    except Exception:
-        pass
-    page.wait_for_timeout(1500)
+        DEBUG["week_click"] = "ok"
+    except Exception as e:
+        DEBUG["week_click"] = "失敗: " + str(e)[:60]
+    page.wait_for_timeout(2500)
     sel = page.locator("select").filter(has_text=re.compile(r"\d{4}/\d{2}/\d{2}〜"))
+    DEBUG["week_select_count"] = sel.count()
     if sel.count() == 0:
         return
     for opt in sel.first.locator("option").all():
@@ -90,7 +102,12 @@ def pick_week(page, target):
             b = dt.date(*map(int, m[1]))
             if a <= target <= b:
                 sel.first.select_option(label=label)
-                page.wait_for_timeout(2000)
+                DEBUG["week_selected"] = label
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
                 return
 
 
@@ -155,12 +172,17 @@ def main():
         if args.dump:
             for t in targets:
                 res = fetch_slots(pw, t, dump=True)
+                print("=== 診断", t, "===")
+                print("DEBUG:", DEBUG)
+                print({k: v for k, v in res.items() if k != "slots"})
                 if "error" in res:
-                    print("ERROR:", res["error"], "→ takachiho_page.html を開発者に渡してください")
                     continue
+                n = 0
                 for c in res["slots"]:
                     if c["date"] == t.strftime("%m/%d"):
+                        n += 1
                         print(c["date"], c["time"], repr(c["text"]), classify(c))
+                print("該当日の枠数:", n)
             return
 
         if args.heartbeat_hours and not args.once:
@@ -175,6 +197,8 @@ def main():
                     if "error" in res:
                         raise RuntimeError(res["error"])
                     key = t.strftime("%m/%d")
+                    if not any(c["date"] == key for c in res["slots"]):
+                        raise RuntimeError(f"{key} の枠が読み取れません(週の切替か表の構造を確認)")
                     for c in res["slots"]:
                         if c["date"] != key or not (args.from_time <= c["time"] <= args.to_time):
                             continue
