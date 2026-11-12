@@ -259,7 +259,17 @@ def fetch_slots(pw, target, dump=False):
         page.on("response", on_resp)
         page.goto(URL, wait_until="networkidle", timeout=60000)
         pick_week(page, target)
+        # 枠(イベント)が描画されるまで待つ（読み込み途中で0件になるのを防ぐ）
+        try:
+            page.wait_for_selector(".fc-event, .fc-bgevent, .fc-bg-event", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
         res = page.evaluate(JS_EXTRACT)
+        key = target.strftime("%m/%d")
+        if "error" not in res and not any(c["date"] == key for c in res["slots"]):
+            page.wait_for_timeout(5000)          # 念のため1回だけ待って再読み取り
+            res = page.evaluate(JS_EXTRACT)
         if "error" not in res and target.strftime("%m/%d") not in res["cols"]:
             res = {"error": "対象日を含む週に移動できませんでした", "cols": res["cols"]}
         if dump:
@@ -343,21 +353,31 @@ def main():
         while active_targets():
             try:
                 found = []
+                fetched, got_any = [], False
                 for t in active_targets():
-                    res = fetch_slots(pw, t)
+                    key = t.strftime("%m/%d")
+                    # 同じ週に入る日は、1回の取得を使い回す（速く・軽く）
+                    res = next((r for r in fetched if key in r.get("cols", [])), None)
+                    if res is None:
+                        res = fetch_slots(pw, t)
+                        fetched.append(res)
                     if "error" in res:
                         raise RuntimeError(res["error"])
-                    key = t.strftime("%m/%d")
-                    if not any(c["date"] == key for c in res["slots"]):
-                        raise RuntimeError(f"{key} の枠が読み取れません(週の切替か表の構造を確認)")
-                    for c in res["slots"]:
-                        if c["date"] != key or not (args.from_time <= c["time"] <= args.to_time):
+                    day = [c for c in res["slots"] if c["date"] == key]
+                    if not day:
+                        print(dt.datetime.now(), key, "枠が表示されていません（予約未開始・休業の可能性）。この日はスキップ")
+                        continue
+                    got_any = True
+                    for c in day:
+                        if not (args.from_time <= c["time"] <= args.to_time):
                             continue
                         k = f'{t}_{c["time"]}'
                         now_avail = classify(c) == "avail"
                         if now_avail and not state.get(k):
                             found.append(f'{t.strftime("%m/%d")} {c["time"]} {c["text"][:8]}')
                         state[k] = now_avail
+                if not got_any:
+                    raise RuntimeError("どの日の枠も読み取れません(表の構造を確認)")
                 STATE_FILE.write_text(json.dumps(state))
                 fails = 0
                 if found:
